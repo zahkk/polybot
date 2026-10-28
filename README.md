@@ -1,107 +1,128 @@
 # polybot
 
-A Polymarket bot that runs two strategies around the clock on a small VPS:
+A Polymarket bot that earns **liquidity rewards** by market making, with an optional AI news trader.
 
-1. **Rewards market maker** places small buy orders on both YES and NO near the midpoint
-   of markets that pay Polymarket liquidity rewards. If both sides fill, it merges the
-   pair back into cash at a locked profit. If one side fills, it offers that side back
-   above cost, and it cuts the position if the price moves too far against it.
-2. **News forecaster** reads RSS feeds (and optionally X accounts). Claude Haiku matches
-   new headlines to markets. Claude Opus then estimates a probability, and the bot buys the
-   underpriced side only if its edge is at least 8¢. It sells once the price reaches
-   Opus's estimate.
+- **Rewards market maker (main strategy).** Polymarket pays daily rewards to resting orders near the
+  midpoint of selected markets. The bot picks the best-paying markets it can afford, skips risky ones,
+  and places small BUY orders on both YES and NO. If both fill, the pair is merged back into cash at a
+  locked profit. If only one fills, it offers that side back above cost and cuts it if the price moves
+  too far against it.
+- **News forecaster (optional, off without an Anthropic key).** Reads RSS/X headlines; Claude Haiku
+  matches them to markets, Claude Opus estimates a probability, and the bot buys only with an edge of
+  at least 8¢.
 
-Paper mode is the default: it uses real market data and simulated orders.
+**Paper mode is the default**: real market data, simulated orders, and estimated rewards using
+Polymarket's published scoring formula. Judge it on **Net (realized + rewards)** on the dashboard.
 
-Paper mode estimates the liquidity rewards your quotes would earn, using Polymarket's published
-scoring formula; live mode also shows what Polymarket actually paid. Judge the bot on
-**Net (realized + rewards)**, not on fills alone.
+> **Realistic expectations:** this is a careful, small-stakes bot, not a money printer. A good result is
+> a few percent a month, and market making can lose money when prices move against you. Paper fills are
+> optimistic (they ignore queue position) and reward estimates are approximate. Go live only with money
+> you can afford to lose.
 
-> **Realistic expectations:** this is a careful, small-stakes bot, not a money printer.
-> Most retail bots lose money. Run paper mode for 1–2 weeks first, then go live with
-> money you can afford to lose. Paper fills are optimistic: they ignore your place in
-> the order queue, and paper mode doesn't estimate liquidity rewards.
+## Quick start (Windows)
+
+1. Install **Python 3.12+** from python.org (tick "Add python.exe to PATH") and **Git**
+   (`winget install --id Git.Git -e`).
+2. Get the code: `git clone https://github.com/zahkk/polybot.git` and open the `polybot` folder.
+3. Double-click **`start.bat`**. The first run installs everything and opens `.env`: fill in at least
+   the Telegram settings (below), save, and run `start.bat` again.
+4. The dashboard opens at http://localhost:8080 and Telegram says "polybot started in PAPER mode".
+
+**Running it while you're away:** double-click **`run.bat`** and type how many minutes to run, or press
+Enter to run until you stop it. When it stops it cancels its orders and sells anything it holds.
+
+**Stopping it properly:** `/stop` in Telegram, the **Stop & close** button on the dashboard, or Ctrl+C.
+Don't just close the window: that skips selling (orders still expire on their own within 10 minutes).
+
+**Updating:** stop the bot, double-click **`update.bat`**, start again.
+
+Keep the computer awake while it runs (Windows sleep: Never, lid open).
 
 ## What you need
 
 | Thing | Where | Cost |
 |---|---|---|
-| VPS (Ubuntu 24.04, 2 GB RAM) | Hetzner (Helsinki) or DigitalOcean. **Not** US/UK/France/Germany, which Polymarket blocks | ~$5/mo |
-| Anthropic API key | console.anthropic.com → API keys, add $5–10 credit | capped by `CLAUDE_DAILY_BUDGET_USD` (default $0.50/day) |
-| Telegram bot | Message **@BotFather** → `/newbot` → copy the token. Message **@userinfobot** to get your chat ID. Then send your new bot any message so it can reply | free |
-| Polymarket account + funds | Your existing account. Export its private key: Polymarket → Profile → Settings → Export Private Key | your capital |
-| X API (optional) | developer.x.com, pay-per-use credits | ~$0.005 per post read |
+| Telegram bot | Message **@BotFather** → `/newbot` → copy the token. Message **@userinfobot** for your chat ID. Send your new bot any message so it can reply | free |
+| Polymarket account + funds (live mode only) | Polymarket → Profile → Settings → **Export Private Key** | your capital |
+| Anthropic API key (optional, news forecaster) | console.anthropic.com → API keys | capped by `CLAUDE_DAILY_BUDGET_USD` (default $0.50/day) |
+| VPS (optional, to run 24/7) | Any Ubuntu 24.04 server with 2 GB RAM, in a country where Polymarket is allowed | ~$5–6/mo |
 
-## Run on Windows
-
-Double-click `start.bat`. The first run installs everything and opens `.env` for you to fill in;
-after that it starts the bot and opens the dashboard. Close the window to stop it.
-
-## Install on the VPS
-
-From your computer, copy the folder to the server, then log in:
-
-```bash
-scp -r polybot root@YOUR_VPS_IP:/root/
-ssh root@YOUR_VPS_IP
-bash /root/polybot/deploy/setup.sh
-nano /home/polybot/polybot/.env      # fill in keys (see .env.example)
-systemctl start polybot
-journalctl -u polybot -f             # live logs; Ctrl+C to stop watching
-```
-
-The bot restarts automatically if it crashes or the server reboots.
+Polymarket blocks some countries (including the US and UK). The bot checks this on startup and
+refuses to trade live from a blocked location. Use it only where you're allowed to.
 
 ## Going live
 
-1. Run in paper mode for 1–2 weeks. Check the daily Telegram summary and the dashboard.
-2. Deposit funds to Polymarket. Put `POLY_PRIVATE_KEY` and `POLY_WALLET_ADDRESS` in `.env`.
-3. Run the pre-flight check (it places no orders):
-   ```bash
-   cd /home/polybot/polybot && sudo -u polybot .venv/bin/python -m polybot.check
+1. Run paper mode for at least a few sessions and check **Net (realized + rewards)**.
+2. Put `POLY_PRIVATE_KEY` and `POLY_WALLET_ADDRESS` in `.env` (never share these or paste them anywhere).
+3. Pre-flight check (places no orders):
    ```
-   If it reports missing approvals, run it again with `--approve`.
-4. Set `MODE=live` in `.env` and run `systemctl restart polybot`.
+   .venv\Scripts\python -m polybot.check
+   ```
+   If the **"Exchange allowances (trading server)"** line isn't ✓, run it again with `--approve`.
+   That creates a Builder API key (saved to `.env`) and sets up the one-time trading approvals.
+4. Delete `polybot.db` (clears paper stats), set `MODE=live` in `.env`, and start the bot.
+5. Watch the first session: the bot's orders should appear under **Open orders** on polymarket.com.
+
+While the bot is live, don't place manual trades on the same account: spending cash looks like a loss
+to the bot and can trip the daily loss limit. (The bot never touches your manual orders or positions.)
 
 ## Controls
 
-**Telegram:** `/status` `/positions` `/pause` `/resume` `/kill` (kill cancels every order and stops trading)
+**Telegram:** `/status` `/positions` `/pause` `/resume` `/kill` `/stop` `/stopin <minutes>`
+- `/kill` cancels every order and stops trading (bot keeps running); `/resume` restarts trading.
+- `/stop` shuts the bot down cleanly; `/stopin 30` stops it in 30 minutes, `/stopin 0` cancels the timer.
 
-**Dashboard:** it only listens on the server itself. View it from your laptop with:
-```bash
-ssh -L 8080:localhost:8080 root@YOUR_VPS_IP
-```
-and open http://localhost:8080. It shows equity, P&L, positions, orders, Claude's
-reasoning for each signal, fills, and has pause/resume/kill buttons.
+**Dashboard** (http://localhost:8080): equity, P&L, estimated and paid rewards, positions, orders,
+fills, events, and Pause / Resume / Kill / Stop & close buttons.
 
 **Automatic safety:**
-- Total exposure cap (`MAX_TOTAL_EXPOSURE_USD`)
-- $5 cash reserve
-- $5 max per forecaster trade
-- Kill switch if equity drops $15 in a UTC day
-- Market-making quotes are pulled when a price jumps 3¢ (usually news)
-- Live mode refuses to start if Polymarket geoblocks the server
+- Exposure cap (`MAX_TOTAL_EXPOSURE_USD`) and cash reserve (`MIN_CASH_RESERVE_USD`)
+- Daily loss kill switch (`DAILY_LOSS_LIMIT_USD`)
+- Skips markets ending within 21 days and event-driven markets (data releases, outages, token launches…)
+- Pulls quotes when a price jumps 3¢; drops a market that jumps 3 times in an hour
+- Live quotes expire after 10 minutes and are renewed, so a crashed or sleeping computer leaves
+  nothing on the book; leftovers are cleaned up on startup
+- One-off trades are fill-and-kill: nothing unintended is left resting
+- Refuses to trade live from a geoblocked location
 
-## Tuning (in `.env`)
+## Settings (`.env`)
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `MM_MAX_MARKETS` | 3 | markets quoted at once |
+| `MODE` | paper | `paper` or `live` |
+| `MAX_TOTAL_EXPOSURE_USD` | 90 | max money in positions + resting buy orders |
+| `DAILY_LOSS_LIMIT_USD` | 15 | equity drop in a UTC day that trips the kill switch |
+| `MM_MAX_MARKETS` | 3 | markets quoted at once (also limited by the exposure cap) |
 | `MM_MAX_PER_MARKET_USD` | 25 | skips reward markets whose minimum order size costs more |
-| `FC_MIN_EDGE` | 0.08 | Opus probability minus price needed to buy |
-| `FC_MAX_TRADE_USD` | 5 | max spend per forecaster trade |
+| `MM_SPREAD_FRACTION` | 0.5 | how far inside the reward band to quote (lower = closer to mid = more rewards, more fills) |
+| `MM_MIN_DAYS_TO_END` | 21 | skip markets resolving sooner than this |
+| `CLOSE_POSITIONS_ON_SHUTDOWN` | true | sell bot-held shares when stopping |
+| `RUN_FOR_MINUTES` | 0 | stop by itself after this long (0 = until stopped); `run.bat` asks for it |
+| `FC_MIN_EDGE` / `FC_MAX_TRADE_USD` | 0.08 / 5 | news forecaster edge and trade size |
 | `CLAUDE_DAILY_BUDGET_USD` | 0.50 | forecaster stops calling Claude after this |
-| `X_ACCOUNTS` | | comma-separated usernames; only used if `X_BEARER_TOKEN` is set |
+| `SUMMARY_HOUR_UTC` | 6 | time of the daily Telegram summary |
 
-Add or remove news sources in `feeds.txt`.
+Sizes should match your balance: roughly exposure cap ≈ 85% of balance, daily loss limit ≈ 15%.
+News sources live in `feeds.txt`.
+
+## Running 24/7 on a Linux VPS (optional)
+
+```
+scp -r polybot root@YOUR_VPS_IP:/root/
+ssh root@YOUR_VPS_IP
+bash /root/polybot/deploy/setup.sh
+nano /home/polybot/polybot/.env
+systemctl start polybot
+journalctl -u polybot -f
+```
+View the dashboard with `ssh -L 8080:localhost:8080 root@YOUR_VPS_IP` and open http://localhost:8080.
 
 ## Development
 
-```bash
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+```
+python -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m pytest -q
 ```
-
-Code map: `polybot/market_maker.py`, `forecaster.py` (strategies) · `exchange.py`
-(paper/live orders via Polymarket's official `polymarket-client` SDK) · `risk.py` ·
-`analyst.py` (Claude) · `news.py` · `telegram.py` · `dashboard.py` · `main.py`.
+Code map: `market_maker.py` + `rewards.py` (main strategy) · `forecaster.py` + `analyst.py` (news) ·
+`exchange.py` (paper/live orders via Polymarket's official `polymarket-client` SDK) · `risk.py` ·
+`check.py` (pre-flight) · `telegram.py` · `dashboard.py` · `main.py`. See `CLAUDE.md` for design notes.
