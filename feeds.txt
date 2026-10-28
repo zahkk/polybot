@@ -1,0 +1,13 @@
+# One RSS feed per line. Lines starting with # are ignored.
+https://feeds.bbci.co.uk/news/world/rss.xml
+https://feeds.bbci.co.uk/news/business/rss.xml
+https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml
+https://rss.nytimes.com/services/xml/rss/nyt/World.xml
+https://www.aljazeera.com/xml/rss/all.xml
+https://www.cnbc.com/id/100003114/device/rss/rss.html
+https://rss.politico.com/politics-news.xml
+https://www.federalreserve.gov/feeds/press_all.xml
+https://www.coindesk.com/arc/outboundfeeds/rss/
+https://www.espn.com/espn/rss/news
+# Google News search feeds work for any topic you trade, e.g.:
+# https://news.google.com/rss/search?q=federal+reserve&hl=en-US&gl=US&ceid=US:en

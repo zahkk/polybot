@@ -1,0 +1,9 @@
+polymarket-client==0.13.0
+anthropic>=1.15,<2
+httpx>=0.27,<1
+feedparser>=6.0,<7
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.6,<3
+pydantic-settings>=2.2,<3
+pytest>=8

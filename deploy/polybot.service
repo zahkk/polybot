@@ -1,0 +1,14 @@
+[Unit]
+Description=polybot Polymarket trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=polybot
+WorkingDirectory=/home/polybot/polybot
+ExecStart=/home/polybot/polybot/.venv/bin/python -m polybot.main
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target
