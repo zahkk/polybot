@@ -309,8 +309,8 @@ def main() -> None:
     setup_logging(s.log_level)
     geo = check_geoblock()
     log.info("geoblock check: %s", geo)
-    if geo.get("blocked") and s.live:
-        log.error("Polymarket reports this server's location as blocked. Refusing to trade live.")
+    if s.live and geo.get("blocked") is not False:
+        log.error("Polymarket's location check says blocked or couldn't be completed. Refusing to trade live.")
         sys.exit(1)
     if s.live:
         log.warning("LIVE MODE: real money. Exposure cap $%.2f, daily loss limit $%.2f",

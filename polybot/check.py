@@ -37,8 +37,8 @@ def main() -> None:
     s = Settings()
     geo = check_geoblock()
     print(f"Location check: {geo}")
-    if geo.get("blocked"):
-        print("✗ Polymarket blocks this server's location. Use a VPS in an allowed country.")
+    if geo.get("blocked") is not False:
+        print("✗ Polymarket blocks this location, or the location check failed (check your internet).")
         sys.exit(1)
     if not s.poly_private_key:
         print("✗ POLY_PRIVATE_KEY is empty in .env")
