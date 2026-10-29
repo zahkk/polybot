@@ -48,7 +48,7 @@ Keep the computer awake while it runs (Windows sleep: Never, lid open).
 | VPS (optional, to run 24/7) | Any Ubuntu 24.04 server with 2 GB RAM, in a country where Polymarket is allowed | ~$5–6/mo |
 
 Polymarket blocks some countries (including the US and UK). The bot checks this on startup and
-refuses to trade live from a blocked location. Use it only where you're allowed to.
+refuses to trade live from a blocked location. Use it only where you're allowed to ;) 
 
 ## Going live
 
@@ -105,7 +105,7 @@ fills, events, and Pause / Resume / Kill / Stop & close buttons.
 Sizes should match your balance: roughly exposure cap ≈ 85% of balance, daily loss limit ≈ 15%.
 News sources live in `feeds.txt`.
 
-## Running 24/7 on a Linux VPS (optional)
+## Running 24/7 on a Linux VPS/virtual private server (optional)
 
 ```
 scp -r polybot root@YOUR_VPS_IP:/root/
