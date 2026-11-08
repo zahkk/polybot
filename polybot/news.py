@@ -1,6 +1,7 @@
 """News sources. RSS is free; X (Twitter) is optional and billed per post read, so it
 only fetches posts newer than the last one it saw."""
 
+import calendar
 import hashlib
 import logging
 import time
@@ -67,7 +68,8 @@ class RSSSource:
                 title = (e.get("title") or "").strip()
                 if not title:
                     continue
-                ts = time.mktime(e.published_parsed) if e.get("published_parsed") else time.time()
+                # feedparser normalizes dates to UTC; mktime would read them as local time.
+                ts = calendar.timegm(e.published_parsed) if e.get("published_parsed") else time.time()
                 if time.time() - ts > 6 * 3600:  # stale; markets have already priced it
                     continue
                 summary = (e.get("summary") or "")[:500]

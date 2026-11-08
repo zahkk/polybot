@@ -1,3 +1,7 @@
+import calendar
+import time
+import types
+
 import pytest
 from fakes import FakePublic, make_market, make_reward
 from fastapi.testclient import TestClient
@@ -207,6 +211,34 @@ def test_rss_parsing_skips_stale_items():
     items = src.fetch()
     assert [i.title for i in items] == ["Fed holds rates"]
     assert items[0].source == "Wire"
+
+ 
+# Parametrizing the tests for test_rss_dates_are_utc_regardless_of_local_timezone with different test scenarios(New York (UTC-5), Berlin (UTC+1))
+@pytest.mark.parametrize("offset_hours", [-5, +1])
+# Long ahh name. May change later. Works for now
+def test_rss_dates_are_utc_regardless_of_local_timezone(monkeypatch, offset_hours):
+    from email.utils import formatdate
+    from polybot.news import RSSSource
+
+    fake_time = types.SimpleNamespace(
+        time=time.time, # real clock
+        mktime=lambda st: calendar.timegm(st) 
+                - offset_hours * 3600,)
+    # Note: This test simulates a non-UTC machine for code that potentially calls time.mktime (which previously introduced a bug)
+    # If someone brings the bug back with some different function (such as datetime.timestamp()) this test won't catch it 
+    monkeypatch.setattr("polybot.news.time", fake_time)
+
+    published = int(time.time()) - 3600  # whole seconds: RSS dates have no fractions
+    xml = f"""<?xml version="1.0"?><rss version="2.0"><channel><title>Wire</title>
+    <item><title>Story</title><link>https://x/1</link><pubDate>{formatdate(published)}</pubDate></item>
+    </channel></rss>""".encode()
+
+    class Resp:
+        content = xml
+    src = RSSSource(["https://feed"])
+    src.http.get = lambda url: Resp()
+    items = src.fetch()
+    assert [i.ts for i in items] == [published]
 
 
 def test_keyword_prefilter_matches_specific_market(env):
