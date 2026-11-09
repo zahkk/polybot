@@ -10,6 +10,7 @@ import logging
 import threading
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
@@ -85,20 +86,31 @@ class _Locked:
         return call
 
 
-def _to_book(ob) -> Book:
-    # The CLOB returns bids ascending and asks descending, so the best level is last.
-    bids = sorted(ob.bids, key=lambda lv: lv.price)
-    asks = sorted(ob.asks, key=lambda lv: lv.price, reverse=True)
+def _make_book(token_id: str, bids: Iterable[tuple[float, float]], asks: Iterable[tuple[float, float]],
+               tick: float, min_size: float) -> Book:
+    """Build a Book from (price, size) pairs in any order; sorts them best first."""
+    bids = sorted(bids, reverse=True)  # highest bid first
+    asks = sorted(asks)  # lowest ask first
     return Book(
-        token_id=str(ob.asset_id),
-        best_bid=float(bids[-1].price) if bids else None,
-        best_ask=float(asks[-1].price) if asks else None,
-        tick=float(ob.tick_size),
-        min_size=float(ob.min_order_size),
-        bid_depth=float(bids[-1].size) if bids else 0.0,
-        ask_depth=float(asks[-1].size) if asks else 0.0,
-        bids=[(float(lv.price), float(lv.size)) for lv in reversed(bids)],
-        asks=[(float(lv.price), float(lv.size)) for lv in reversed(asks)],
+        token_id=token_id,
+        best_bid=bids[0][0] if bids else None,
+        best_ask=asks[0][0] if asks else None,
+        tick=tick,
+        min_size=min_size,
+        bid_depth=bids[0][1] if bids else 0.0,
+        ask_depth=asks[0][1] if asks else 0.0,
+        bids=bids,
+        asks=asks,
+    )
+
+
+def _to_book(ob) -> Book:
+    return _make_book(
+        str(ob.asset_id),
+        [(float(lv.price), float(lv.size)) for lv in ob.bids],
+        [(float(lv.price), float(lv.size)) for lv in ob.asks],
+        float(ob.tick_size),
+        float(ob.min_order_size),
     )
 
 
