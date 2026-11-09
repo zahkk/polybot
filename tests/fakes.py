@@ -1,8 +1,11 @@
 """In-memory stand-in for Polymarket's PublicClient."""
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace as NS
+
+from polymarket.streams import MarketBookEvent, MarketPriceChangeEvent, MarketTickSizeChangeEvent
 
 
 class Pager:
@@ -85,3 +88,69 @@ def make_market(mid="m1", cid="c1", question="Will X happen by June?", yes="Y1",
 def make_reward(cid="c1", max_spread=3.0, min_size=10, rate=20):
     return NS(condition_id=cid, rewards_max_spread=max_spread, rewards_min_size=Decimal(str(min_size)),
               total_daily_rate=Decimal(str(rate)), native_daily_rate=Decimal(str(rate)))
+
+
+# --- market WebSocket events, built from the same JSON shape Polymarket sends ----------------
+def _wire_levels(levels):
+    return [{"price": str(p), "size": str(s)} for p, s in levels]
+
+
+def book_event(token, bids, asks, tick=0.01, min_size=5):
+    """A full "book" snapshot. bids/asks: [(price, size), ...] in any order."""
+    return MarketBookEvent.model_validate({"type": "book", "payload": {
+        "market": "c1", "asset_id": token,
+        # Like the CLOB: bids ascending, asks descending (best level last).
+        "bids": _wire_levels(sorted(bids)), "asks": _wire_levels(sorted(asks, reverse=True)),
+        "tick_size": None if tick is None else str(tick),
+        "min_order_size": None if min_size is None else str(min_size),
+    }})
+
+
+def change_event(*changes):
+    """A "price_change": each change is (token, side, price, new_total_size)."""
+    return MarketPriceChangeEvent.model_validate({"type": "price_change", "payload": {
+        "market": "c1",
+        "price_changes": [{"asset_id": t, "side": side, "price": str(p), "size": str(s)}
+                          for t, side, p, s in changes],
+    }})
+
+
+def tick_event(token, new_tick):
+    return MarketTickSizeChangeEvent.model_validate({"type": "tick_size_change", "payload": {
+        "market": "c1", "asset_id": token, "new_tick_size": str(new_tick),
+    }})
+
+
+class FakeHandle:
+    """One subscription. Plays `script` in order: events are delivered, exceptions raised.
+    Afterwards it waits forever (a quiet market), or ends if `end` is set."""
+
+    def __init__(self, script, end=False):
+        self.script = list(script)
+        self.end = end
+        self.closed = False
+
+    async def __anext__(self):
+        if self.script:
+            item = self.script.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        if self.end:
+            raise StopAsyncIteration
+        await asyncio.Event().wait()
+
+    async def close(self):
+        self.closed = True
+
+
+class FakeStreamClient:
+    """Stand-in for AsyncPublicClient.subscribe: hands out the given handles one per subscribe."""
+
+    def __init__(self, *handles):
+        self.handles = list(handles)
+        self.subscribed = []  # token lists, one per subscribe call
+
+    async def subscribe(self, spec):
+        self.subscribed.append(list(spec.asset_ids))
+        return self.handles.pop(0) if self.handles else FakeHandle([])

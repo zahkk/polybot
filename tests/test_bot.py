@@ -1,12 +1,14 @@
+import asyncio
+
 import pytest
-from fakes import FakePublic, make_market, make_reward
+from fakes import FakeHandle, FakePublic, FakeStreamClient, book_event, change_event, make_market, make_reward, tick_event
 from fastapi.testclient import TestClient
 
 from polybot.analyst import Forecast
 from polybot.config import Settings
 from polybot.dashboard import build_app
 from polybot.db import DB
-from polybot.exchange import PaperExchange, round_to_tick
+from polybot.exchange import BookCache, PaperExchange, round_to_tick, run_market_stream
 from polybot.forecaster import Forecaster
 from polybot.market_maker import MarketMaker
 from polybot.risk import Risk
@@ -402,3 +404,160 @@ def test_take_fills_available_and_leaves_nothing_resting(env):
     # Selling more than we hold only sells what we have.
     ex.take(token_id="Y1", side="SELL", size=50, limit_price=0.40, strategy="fc", market="m1", outcome="Yes")
     assert db.position("Y1") is None and ex.open_orders() == []
+
+
+def test_book_cache_snapshot_gives_best_first_book():
+    cache = BookCache()
+    cache.apply(book_event("Y1", bids=[(0.44, 20), (0.46, 100), (0.45, 50)], asks=[(0.49, 10), (0.47, 30)],
+                           tick=0.001, min_size=5))
+    b = cache.get("Y1")
+    assert b.bids == [(0.46, 100), (0.45, 50), (0.44, 20)] and b.asks == [(0.47, 30), (0.49, 10)]
+    assert (b.best_bid, b.bid_depth, b.best_ask, b.ask_depth) == (0.46, 100, 0.47, 30)
+    assert (b.tick, b.min_size) == (0.001, 5)
+    assert cache.get("N1") is None  # never had a snapshot
+
+
+def test_book_cache_price_changes_set_totals_and_remove_empty_levels():
+    cache = BookCache()
+    cache.apply(book_event("Y1", bids=[(0.46, 100), (0.45, 50)], asks=[(0.47, 30)]))
+    cache.apply(change_event(
+        ("Y1", "BUY", 0.46, 80),   # new total at 0.46, not +80
+        ("Y1", "BUY", 0.45, 0),    # nobody left at 0.45
+        ("Y1", "BUY", 0.44, 10),   # new level
+        ("Y1", "SELL", 0.48, 25),  # SELL side updates the asks
+    ))
+    b = cache.get("Y1")
+    assert b.bids == [(0.46, 80), (0.44, 10)]
+    assert b.asks == [(0.47, 30), (0.48, 25)]
+
+
+def test_book_cache_routes_changes_by_token_and_skips_tokens_without_snapshot():
+    cache = BookCache()
+    cache.apply(book_event("Y1", bids=[(0.46, 100)], asks=[(0.47, 30)]))
+    cache.apply(book_event("N1", bids=[(0.53, 30)], asks=[(0.54, 100)]))
+    # One event carries both sides of the market (YES bid mirrors NO ask), plus a token we never saw.
+    cache.apply(change_event(("Y1", "BUY", 0.46, 90), ("N1", "SELL", 0.54, 90), ("X9", "BUY", 0.10, 5)))
+    assert cache.get("Y1").bids == [(0.46, 90)]
+    assert cache.get("N1").asks == [(0.54, 90)]
+    assert cache.get("X9") is None  # a book built from changes alone would be incomplete
+
+
+def test_book_cache_snapshot_replaces_book_and_keeps_known_tick():
+    cache = BookCache()
+    cache.apply(book_event("Y1", bids=[(0.46, 100), (0.45, 50)], asks=[(0.47, 30)], tick=0.001, min_size=5))
+    # The 0.45 bid was cancelled while we missed its change; the next snapshot must drop it.
+    cache.apply(book_event("Y1", bids=[(0.46, 100)], asks=[(0.47, 30)], tick=None, min_size=None))
+    b = cache.get("Y1")
+    assert b.bids == [(0.46, 100)]
+    assert (b.tick, b.min_size) == (0.001, 5)  # snapshot left them out: keep what we knew
+    cache.apply(tick_event("Y1", 0.01))
+    assert cache.get("Y1").tick == 0.01
+
+
+def test_book_cache_get_returns_a_copy():
+    cache = BookCache()
+    cache.apply(book_event("Y1", bids=[(0.46, 100)], asks=[(0.47, 30)]))
+    b = cache.get("Y1")
+    cache.apply(change_event(("Y1", "BUY", 0.46, 0)))
+    assert b.bids == [(0.46, 100)]  # the market maker's Book doesn't change under it
+    assert cache.get("Y1").bids == []
+
+
+def test_book_cache_is_unusable_when_stream_is_silent_or_cleared():
+    cache = BookCache()
+    cache.apply(book_event("Y1", bids=[(0.46, 100)], asks=[(0.47, 30)]))
+    cache.last_message -= 120  # nothing heard from the stream for 2 minutes
+    assert cache.get("Y1") is None
+    cache.apply(change_event(("Y1", "BUY", 0.46, 90)))  # stream is back
+    assert cache.get("Y1").bids == [(0.46, 90)]
+    cache.clear()  # e.g. after a disconnect
+    assert cache.get("Y1") is None
+
+
+def test_books_prefer_the_stream_cache(env):
+    s, db, pub, ex, risk, notes = env
+    pub.set_book("Y1", 0.40, 0.42)  # what the REST API would say
+    cache = BookCache()
+    cache.apply(book_event("Y1", bids=[(0.46, 100)], asks=[(0.47, 30)]))
+    ex.cache = cache
+    assert ex.books(["Y1"])["Y1"].best_bid == 0.46
+    assert ex.book("Y1").best_bid == 0.46
+
+
+def test_books_fall_back_to_rest_for_tokens_the_cache_lacks(env):
+    s, db, pub, ex, risk, notes = env
+    pub.set_book("Y1", 0.40, 0.42)
+    pub.set_book("N1", 0.57, 0.59)
+    cache = BookCache()
+    cache.apply(book_event("Y1", bids=[(0.46, 100)], asks=[(0.47, 30)]))
+    ex.cache = cache
+    books = ex.books(["Y1", "N1"])
+    assert books["Y1"].best_bid == 0.46  # from the stream
+    assert books["N1"].best_bid == 0.57  # from REST
+    cache.last_message -= 120  # stream went quiet: everything comes from REST again
+    assert ex.books(["Y1"])["Y1"].best_bid == 0.40
+    assert ex.book("Y1").best_bid == 0.40
+
+
+def _stream_until(cache, tokens, client, done, timeout=2.0):
+    """Run the stream until done() is true, then stop it the way shutdown does (cancel)."""
+    async def go():
+        task = asyncio.create_task(run_market_stream(cache, tokens, client, poll=0.01, retry=0.01))
+        deadline = asyncio.get_running_loop().time() + timeout
+        while not done():
+            assert asyncio.get_running_loop().time() < deadline, "stream never got there"
+            await asyncio.sleep(0.005)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    asyncio.run(go())
+
+
+def test_stream_feeds_the_cache_and_closes_on_shutdown():
+    cache = BookCache()
+    handle = FakeHandle([book_event("Y1", bids=[(0.46, 100)], asks=[(0.47, 30)])])
+    client = FakeStreamClient(handle)
+    _stream_until(cache, lambda: {"Y1", "N1"}, client, lambda: cache.get("Y1") is not None)
+    assert client.subscribed == [["N1", "Y1"]]
+    assert cache.get("Y1").best_bid == 0.46
+    assert handle.closed
+
+
+def test_stream_waits_for_tokens_then_follows_market_changes():
+    cache = BookCache()
+    first = FakeHandle([])  # a quiet market: no events at all
+    client = FakeStreamClient(first, FakeHandle([]))
+    calls = 0
+
+    def tokens():
+        nonlocal calls
+        calls += 1
+        if calls <= 3:
+            return set()  # the market maker hasn't picked its markets yet
+        if not client.subscribed:
+            return {"Y1"}
+        return {"Y1", "N1"}  # then it switches markets while the first subscription is quiet
+
+    _stream_until(cache, tokens, client, lambda: len(client.subscribed) == 2)
+    assert client.subscribed == [["Y1"], ["N1", "Y1"]]  # never subscribed to an empty list
+    assert first.closed
+
+
+def test_stream_error_clears_cache_and_resubscribes():
+    cache = BookCache()
+    broken = FakeHandle([book_event("Y1", bids=[(0.46, 100)], asks=[(0.47, 30)]), ConnectionError("dropped")])
+    client = FakeStreamClient(broken, FakeHandle([]))
+    _stream_until(cache, lambda: {"Y1"}, client, lambda: len(client.subscribed) == 2)
+    assert cache.get("Y1") is None  # books from before the gap can't be trusted
+    assert broken.closed
+
+
+def test_stream_end_clears_cache_and_resubscribes():
+    cache = BookCache()
+    ended = FakeHandle([book_event("Y1", bids=[(0.46, 100)], asks=[(0.47, 30)])], end=True)
+    client = FakeStreamClient(ended, FakeHandle([]))
+    _stream_until(cache, lambda: {"Y1"}, client, lambda: len(client.subscribed) == 2)
+    assert cache.get("Y1") is None  # events may have been missed before it ended
+    assert ended.closed

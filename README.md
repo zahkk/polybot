@@ -94,6 +94,7 @@ fills, events, and Pause / Resume / Kill / Stop & close buttons.
 | `DAILY_LOSS_LIMIT_USD` | 15 | equity drop in a UTC day that trips the kill switch |
 | `MM_MAX_MARKETS` | 3 | markets quoted at once (also limited by the exposure cap) |
 | `MM_MAX_PER_MARKET_USD` | 25 | skips reward markets whose minimum order size costs more |
+| `MM_USE_STREAM` | true | read order books from Polymarket's live WebSocket (`false` = poll every refresh instead) |
 | `MM_SPREAD_FRACTION` | 0.5 | how far inside the reward band to quote (lower = closer to mid = more rewards, more fills) |
 | `MM_MIN_DAYS_TO_END` | 21 | skip markets resolving sooner than this |
 | `CLOSE_POSITIONS_ON_SHUTDOWN` | true | sell bot-held shares when stopping |

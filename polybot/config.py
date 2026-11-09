@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     mm_max_markets: int = 3
     mm_max_per_market_usd: float = 25.0
     mm_refresh_seconds: int = 20
+    # Order books from the market WebSocket (REST as fallback). false = poll REST only, as before.
+    mm_use_stream: bool = True
     # Live quotes expire after this long (Polymarket minimum is 3 minutes) and are renewed
     # 2 minutes before. If the bot dies, its orders disappear within this time.
     order_ttl_seconds: int = 600

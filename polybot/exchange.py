@@ -6,19 +6,24 @@ fills when the best ask drops to our price, a SELL when the best bid rises to it
 That ignores queue position, so paper results are optimistic for market making.
 """
 
+import asyncio
 import logging
 import threading
 import time
 import uuid
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
-from polymarket import AcceptedOrder, InsufficientLiquidityError, PublicClient, SecureClient
+from polymarket import (AcceptedOrder, AsyncPublicClient, InsufficientLiquidityError, OrderBookLevel,
+                        PublicClient, SecureClient)
+from polymarket.streams import MarketEvent, MarketSpec
 
 from .config import Settings
 from .db import DB
 
 log = logging.getLogger(__name__)
+
 
 
 @dataclass
@@ -84,22 +89,130 @@ class _Locked:
 
         return call
 
+def _levels(levels: Iterable[OrderBookLevel]) -> dict[float, float]:
+    # SDK order book levels -> {price: size} as floats.
+    return {float(lv.price): float(lv.size) for lv in levels}
+
+
+def _make_book(token_id: str, bids: Iterable[tuple[float, float]], asks: Iterable[tuple[float, float]],
+               tick: float, min_size: float) -> Book:
+    """Build a Book from (price, size) pairs in any order; sorts them best first."""
+    bids = sorted(bids, reverse=True)  # highest bid first
+    asks = sorted(asks)  # lowest ask first
+    return Book(
+        token_id=token_id,
+        best_bid=bids[0][0] if bids else None,
+        best_ask=asks[0][0] if asks else None,
+        tick=tick,
+        min_size=min_size,
+        bid_depth=bids[0][1] if bids else 0.0,
+        ask_depth=asks[0][1] if asks else 0.0,
+        bids=bids,
+        asks=asks,
+    )
+
 
 def _to_book(ob) -> Book:
-    # The CLOB returns bids ascending and asks descending, so the best level is last.
-    bids = sorted(ob.bids, key=lambda lv: lv.price)
-    asks = sorted(ob.asks, key=lambda lv: lv.price, reverse=True)
-    return Book(
-        token_id=str(ob.asset_id),
-        best_bid=float(bids[-1].price) if bids else None,
-        best_ask=float(asks[-1].price) if asks else None,
-        tick=float(ob.tick_size),
-        min_size=float(ob.min_order_size),
-        bid_depth=float(bids[-1].size) if bids else 0.0,
-        ask_depth=float(asks[-1].size) if asks else 0.0,
-        bids=[(float(lv.price), float(lv.size)) for lv in reversed(bids)],
-        asks=[(float(lv.price), float(lv.size)) for lv in reversed(asks)],
+    return _make_book(
+        str(ob.asset_id),
+        [(float(lv.price), float(lv.size)) for lv in ob.bids],
+        [(float(lv.price), float(lv.size)) for lv in ob.asks],
+        float(ob.tick_size),
+        float(ob.min_order_size),
     )
+
+@dataclass
+class _TokenState:
+    bids: dict[float, float] = field(default_factory=dict) # price -> size 
+    asks: dict[float, float] = field(default_factory=dict) # price -> size 
+
+    tick: float = 0.01
+    min_size: float = 0.0 
+    updated: float = 0.0 # time.time() of last event
+
+class BookCache:
+    def __init__(self):
+        self._states: dict[str, _TokenState] = {}
+        self._lock = threading.Lock()
+        self.last_message = 0.0 # for any event/token, this is just to check if the stream is alive
+
+    def apply(self, event: MarketEvent) -> None:
+        with self._lock:
+            self.last_message = time.time()
+            if event.type == "book":
+                # We replace this token's bids/asks with the information from event.payload. If the token didn't exist previously in our _states var, it will be created
+                p = event.payload
+                token_id = str(p.asset_id)
+                old = self._states.get(token_id)
+                self._states[token_id] = _TokenState(
+                    bids=_levels(p.bids),
+                    asks=_levels(p.asks),
+                    tick=float(p.tick_size) if p.tick_size is not None else (old.tick if old else 0.01),
+                    min_size=float(p.min_order_size) if p.min_order_size is not None else (old.min_size if old else 0.0),
+                    updated=time.time(),
+                )
+            elif event.type == "price_change":
+                for change in event.payload.price_changes:
+                    token_id = str(change.asset_id)
+                    state = self._states.get(token_id)
+                    if state is None:
+                        continue
+                    # change bids on buy, change asks on change.side == "SELL" (not explicitely written, but change.side can only be either BUY or SELL)
+                    levels = state.bids if change.side == "BUY" else state.asks
+                    price = float(change.price)
+                    if change.size == 0:
+                        levels.pop(price, None)
+                    else:
+                        levels[price] = float(change.size)
+                    state.updated = time.time()
+            elif event.type == "tick_size_change":
+                state = self._states.get(str(event.payload.asset_id))
+                if state is not None:
+                    state.tick = float(event.payload.new_tick_size)
+
+    def clear(self) -> None:
+        """Forget everything, e.g. after a disconnect; fresh snapshots refill the thing."""
+        with self._lock:
+            self._states.clear()
+
+    def get(self, token_id: str, max_silence: float = 60.0) -> Book | None:
+        """A snapshot of the book, or None if we don't got it or the stream went mute for whatever unfortunate reason"""
+        with self._lock:
+            state =self._states.get(token_id)
+            if state is None or time.time() - self.last_message > max_silence :
+                return None
+            # sorted() inside makes new lists, so the Book doesn't reference the live dicts.
+            return _make_book(token_id, state.bids.items(), state.asks.items(), state.tick, state.min_size)
+
+
+async def run_market_stream(cache: BookCache, current_tokens: Callable[[], set[str]],
+                            client: AsyncPublicClient, *, poll: float = 5, retry: float = 3) -> None:
+    """Keep `cache` filled from the market WebSocket for whatever tokens are wanted right now."""
+    while True:
+        tokens = current_tokens()
+        if not tokens:  # nothing chosen yet
+            await asyncio.sleep(retry)
+            continue
+        handle = None
+        try:
+            handle = await client.subscribe(MarketSpec(asset_ids=sorted(tokens)))
+            log.info("stream: watching %d tokens", len(tokens))
+            while current_tokens() == tokens:  # until the market maker switches markets; then resubscribe
+                try:
+                    event = await asyncio.wait_for(handle.__anext__(), timeout=poll)
+                except asyncio.TimeoutError:
+                    continue  # quiet market, unfortunately
+                except StopAsyncIteration:
+                    cache.clear()  # usually a dropped connection: same as an error
+                    break  # the stream ended, so resubscribe
+                cache.apply(event)
+        except Exception as e:
+            log.warning("stream: %s; falling back to REST until the WebSocket stream reconnects", e)
+            cache.clear()  # we missed events while it was down
+            await asyncio.sleep(retry)
+        finally:
+            if handle is not None:
+                await handle.close()
 
 
 def round_to_tick(price: float, tick: float, side: str) -> float:
@@ -110,22 +223,32 @@ def round_to_tick(price: float, tick: float, side: str) -> float:
 
 
 class BaseExchange:
-    def __init__(self, settings: Settings, db: DB, public: PublicClient):
+    def __init__(self, settings: Settings, db: DB, public: PublicClient, cache: BookCache | None = None):
         self.s = settings
         self.db = db
         self.public = public
+        self.cache = cache  # live books from the market WebSocket; None = always ask the REST API
 
     # --- market data (shared) --------------------------------------------------------
     def book(self, token_id: str) -> Book:
-        return _to_book(self.public.get_order_book(token_id=token_id))
+        cached = self.cache.get(token_id) if self.cache else None
+        return cached or _to_book(self.public.get_order_book(token_id=token_id))
 
     def books(self, token_ids: list[str]) -> dict[str, Book]:
         out: dict[str, Book] = {}
-        for i in range(0, len(token_ids), 50):
-            for ob in self.public.get_order_books(token_ids=token_ids[i : i + 50]):
+        if self.cache:
+            for t in token_ids:
+                b = self.cache.get(t)
+                if b is not None:
+                    out[t] = b
+        # Whatever the stream can't vouch for (no snapshot yet, stream quiet) comes from REST.
+        missing = [t for t in token_ids if t not in out]
+        for i in range(0, len(missing), 50):
+            for ob in self.public.get_order_books(token_ids=missing[i : i + 50]):
                 b = _to_book(ob)
                 out[b.token_id] = b
         return out
+
 
     def midpoints(self, token_ids: list[str]) -> dict[str, float]:
         out: dict[str, float] = {}

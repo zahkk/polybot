@@ -13,6 +13,8 @@ Personal/owner context lives in `CLAUDE.local.md` (gitignored, never committed).
 - `polybot/exchange.py`: `PaperExchange` / `LiveExchange` share one interface, built on Polymarket's
   official unified SDK `polymarket-client` (the old `py-clob-client` packages are dead since CLOB V2,
   April 2026). Books use an **adjusted midpoint** that ignores orders below the reward min size.
+  Books come from `BookCache`, kept current by the market WebSocket (`run_market_stream`, following
+  the MM's chosen tokens); REST fills in when the stream is quiet or down. `MM_USE_STREAM=false` = REST only.
 - `polybot/market_maker.py`: picks reward markets (top 80 payers -> tight two-sided book inside the
   reward band -> skip event-driven keywords and markets ending within 21 days -> rank by estimated
   reward per dollar -> as many as the exposure cap funds). Quotes BUY YES and BUY NO; merges completed
