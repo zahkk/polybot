@@ -6,16 +6,18 @@ fills when the best ask drops to our price, a SELL when the best bid rises to it
 That ignores queue position, so paper results are optimistic for market making.
 """
 
+import asyncio
 import logging
 import threading
 import time
 import uuid
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
-from polymarket import AcceptedOrder, InsufficientLiquidityError, OrderBookLevel, PublicClient, SecureClient
-from polymarket.streams import MarketEvent
+from polymarket import (AcceptedOrder, AsyncPublicClient, InsufficientLiquidityError, OrderBookLevel,
+                        PublicClient, SecureClient)
+from polymarket.streams import MarketEvent, MarketSpec
 
 from .config import Settings
 from .db import DB
@@ -181,6 +183,35 @@ class BookCache:
                 return None
             # sorted() inside makes new lists, so the Book doesn't reference the live dicts.
             return _make_book(token_id, state.bids.items(), state.asks.items(), state.tick, state.min_size)
+
+
+async def run_market_stream(cache: BookCache, current_tokens: Callable[[], set[str]],
+                            client: AsyncPublicClient, *, poll: float = 5, retry: float = 3) -> None:
+    """Keep `cache` filled from the market WebSocket for whatever tokens are wanted right now."""
+    while True:
+        tokens = current_tokens()
+        if not tokens:  # nothing chosen yet
+            await asyncio.sleep(retry)
+            continue
+        handle = None
+        try:
+            handle = await client.subscribe(MarketSpec(asset_ids=sorted(tokens)))
+            log.info("stream: watching %d tokens", len(tokens))
+            while current_tokens() == tokens:  # until the market maker switches markets; then resubscribe
+                try:
+                    event = await asyncio.wait_for(handle.__anext__(), timeout=poll)
+                except asyncio.TimeoutError:
+                    continue  # quiet market, unfortunately
+                except StopAsyncIteration:
+                    break  # the stream ended, so resubscribe
+                cache.apply(event)
+        except Exception as e:
+            log.warning("stream: %s; falling back to REST until the WebSocket stream reconnects", e)
+            cache.clear()  # we missed events while it was down
+            await asyncio.sleep(retry)
+        finally:
+            if handle is not None:
+                await handle.close()
 
 
 def round_to_tick(price: float, tick: float, side: str) -> float:

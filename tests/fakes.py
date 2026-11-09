@@ -1,5 +1,6 @@
 """In-memory stand-in for Polymarket's PublicClient."""
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace as NS
@@ -118,3 +119,38 @@ def tick_event(token, new_tick):
     return MarketTickSizeChangeEvent.model_validate({"type": "tick_size_change", "payload": {
         "market": "c1", "asset_id": token, "new_tick_size": str(new_tick),
     }})
+
+
+class FakeHandle:
+    """One subscription. Plays `script` in order: events are delivered, exceptions raised.
+    Afterwards it waits forever (a quiet market), or ends if `end` is set."""
+
+    def __init__(self, script, end=False):
+        self.script = list(script)
+        self.end = end
+        self.closed = False
+
+    async def __anext__(self):
+        if self.script:
+            item = self.script.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        if self.end:
+            raise StopAsyncIteration
+        await asyncio.Event().wait()
+
+    async def close(self):
+        self.closed = True
+
+
+class FakeStreamClient:
+    """Stand-in for AsyncPublicClient.subscribe: hands out the given handles one per subscribe."""
+
+    def __init__(self, *handles):
+        self.handles = list(handles)
+        self.subscribed = []  # token lists, one per subscribe call
+
+    async def subscribe(self, spec):
+        self.subscribed.append(list(spec.asset_ids))
+        return self.handles.pop(0) if self.handles else FakeHandle([])

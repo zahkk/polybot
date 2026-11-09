@@ -1,12 +1,14 @@
+import asyncio
+
 import pytest
-from fakes import FakePublic, book_event, change_event, make_market, make_reward, tick_event
+from fakes import FakeHandle, FakePublic, FakeStreamClient, book_event, change_event, make_market, make_reward, tick_event
 from fastapi.testclient import TestClient
 
 from polybot.analyst import Forecast
 from polybot.config import Settings
 from polybot.dashboard import build_app
 from polybot.db import DB
-from polybot.exchange import BookCache, PaperExchange, round_to_tick
+from polybot.exchange import BookCache, PaperExchange, round_to_tick, run_market_stream
 from polybot.forecaster import Forecaster
 from polybot.market_maker import MarketMaker
 from polybot.risk import Risk
@@ -495,3 +497,66 @@ def test_books_fall_back_to_rest_for_tokens_the_cache_lacks(env):
     cache.last_message -= 120  # stream went quiet: everything comes from REST again
     assert ex.books(["Y1"])["Y1"].best_bid == 0.40
     assert ex.book("Y1").best_bid == 0.40
+
+
+def _stream_until(cache, tokens, client, done, timeout=2.0):
+    """Run the stream until done() is true, then stop it the way shutdown does (cancel)."""
+    async def go():
+        task = asyncio.create_task(run_market_stream(cache, tokens, client, poll=0.01, retry=0.01))
+        deadline = asyncio.get_running_loop().time() + timeout
+        while not done():
+            assert asyncio.get_running_loop().time() < deadline, "stream never got there"
+            await asyncio.sleep(0.005)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    asyncio.run(go())
+
+
+def test_stream_feeds_the_cache_and_closes_on_shutdown():
+    cache = BookCache()
+    handle = FakeHandle([book_event("Y1", bids=[(0.46, 100)], asks=[(0.47, 30)])])
+    client = FakeStreamClient(handle)
+    _stream_until(cache, lambda: {"Y1", "N1"}, client, lambda: cache.get("Y1") is not None)
+    assert client.subscribed == [["N1", "Y1"]]
+    assert cache.get("Y1").best_bid == 0.46
+    assert handle.closed
+
+
+def test_stream_waits_for_tokens_then_follows_market_changes():
+    cache = BookCache()
+    first = FakeHandle([])  # a quiet market: no events at all
+    client = FakeStreamClient(first, FakeHandle([]))
+    calls = 0
+
+    def tokens():
+        nonlocal calls
+        calls += 1
+        if calls <= 3:
+            return set()  # the market maker hasn't picked its markets yet
+        if not client.subscribed:
+            return {"Y1"}
+        return {"Y1", "N1"}  # then it switches markets while the first subscription is quiet
+
+    _stream_until(cache, tokens, client, lambda: len(client.subscribed) == 2)
+    assert client.subscribed == [["Y1"], ["N1", "Y1"]]  # never subscribed to an empty list
+    assert first.closed
+
+
+def test_stream_error_clears_cache_and_resubscribes():
+    cache = BookCache()
+    broken = FakeHandle([book_event("Y1", bids=[(0.46, 100)], asks=[(0.47, 30)]), ConnectionError("dropped")])
+    client = FakeStreamClient(broken, FakeHandle([]))
+    _stream_until(cache, lambda: {"Y1"}, client, lambda: len(client.subscribed) == 2)
+    assert cache.get("Y1") is None  # books from before the gap can't be trusted
+    assert broken.closed
+
+
+def test_stream_resubscribes_when_the_stream_ends():
+    cache = BookCache()
+    ended = FakeHandle([book_event("Y1", bids=[(0.46, 100)], asks=[(0.47, 30)])], end=True)
+    client = FakeStreamClient(ended, FakeHandle([]))
+    _stream_until(cache, lambda: {"Y1"}, client, lambda: len(client.subscribed) == 2)
+    assert ended.closed
