@@ -554,9 +554,10 @@ def test_stream_error_clears_cache_and_resubscribes():
     assert broken.closed
 
 
-def test_stream_resubscribes_when_the_stream_ends():
+def test_stream_end_clears_cache_and_resubscribes():
     cache = BookCache()
     ended = FakeHandle([book_event("Y1", bids=[(0.46, 100)], asks=[(0.47, 30)])], end=True)
     client = FakeStreamClient(ended, FakeHandle([]))
     _stream_until(cache, lambda: {"Y1"}, client, lambda: len(client.subscribed) == 2)
+    assert cache.get("Y1") is None  # events may have been missed before it ended
     assert ended.closed

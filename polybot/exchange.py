@@ -203,6 +203,7 @@ async def run_market_stream(cache: BookCache, current_tokens: Callable[[], set[s
                 except asyncio.TimeoutError:
                     continue  # quiet market, unfortunately
                 except StopAsyncIteration:
+                    cache.clear()  # usually a dropped connection: same as an error
                     break  # the stream ended, so resubscribe
                 cache.apply(event)
         except Exception as e:
