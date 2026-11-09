@@ -14,12 +14,14 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 
-from polymarket import AcceptedOrder, InsufficientLiquidityError, PublicClient, SecureClient
+from polymarket import AcceptedOrder, InsufficientLiquidityError, OrderBookLevel, PublicClient, SecureClient
+from polymarket.streams import MarketEvent
 
 from .config import Settings
 from .db import DB
 
 log = logging.getLogger(__name__)
+
 
 
 @dataclass
@@ -85,6 +87,10 @@ class _Locked:
 
         return call
 
+def _levels(levels: Iterable[OrderBookLevel]) -> dict[float, float]:
+    # SDK order book levels -> {price: size} as floats.
+    return {float(lv.price): float(lv.size) for lv in levels}
+
 
 def _make_book(token_id: str, bids: Iterable[tuple[float, float]], asks: Iterable[tuple[float, float]],
                tick: float, min_size: float) -> Book:
@@ -112,6 +118,69 @@ def _to_book(ob) -> Book:
         float(ob.tick_size),
         float(ob.min_order_size),
     )
+
+@dataclass
+class _TokenState:
+    bids: dict[float, float] = field(default_factory=dict) # price -> size 
+    asks: dict[float, float] = field(default_factory=dict) # price -> size 
+
+    tick: float = 0.01
+    min_size: float = 0.0 
+    updated: float = 0.0 # time.time() of last event
+
+class BookCache:
+    def __init__(self):
+        self._states: dict[str, _TokenState] = {}
+        self._lock = threading.Lock()
+        self.last_message = 0.0 # for any event/token, this is just to check if the stream is alive
+
+    def apply(self, event: MarketEvent) -> None:
+        with self._lock:
+            self.last_message = time.time()
+            if event.type == "book":
+                # We replace this token's bids/asks with the information from event.payload. If the token didn't exist previously in our _states var, it will be created
+                p = event.payload
+                token_id = str(p.asset_id)
+                old = self._states.get(token_id)
+                self._states[token_id] = _TokenState(
+                    bids=_levels(p.bids),
+                    asks=_levels(p.asks),
+                    tick=float(p.tick_size) if p.tick_size is not None else (old.tick if old else 0.01),
+                    min_size=float(p.min_order_size) if p.min_order_size is not None else (old.min_size if old else 0.0),
+                    updated=time.time(),
+                )
+            elif event.type == "price_change":
+                for change in event.payload.price_changes:
+                    token_id = str(change.asset_id)
+                    state = self._states.get(token_id)
+                    if state is None:
+                        continue
+                    # change bids on buy, change asks on change.side == "SELL" (not explicitely written, but change.side can only be either BUY or SELL)
+                    levels = state.bids if change.side == "BUY" else state.asks
+                    price = float(change.price)
+                    if change.size == 0:
+                        levels.pop(price, None)
+                    else:
+                        levels[price] = float(change.size)
+                    state.updated = time.time()
+            elif event.type == "tick_size_change":
+                state = self._states.get(str(event.payload.asset_id))
+                if state is not None:
+                    state.tick = float(event.payload.new_tick_size)
+
+    def clear(self) -> None:
+        """Forget everything, e.g. after a disconnect; fresh snapshots refill the thing."""
+        with self._lock:
+            self._states.clear()
+
+    def get(self, token_id: str, max_silence: float = 60.0) -> Book | None:
+        """A snapshot of the book, or None if we don't got it or the stream went mute for whatever unfortunate reason"""
+        with self._lock:
+            state =self._states.get(token_id)
+            if state is None or time.time() - self.last_message > max_silence :
+                return None
+            # sorted() inside makes new lists, so the Book doesn't reference the live dicts.
+            return _make_book(token_id, state.bids.items(), state.asks.items(), state.tick, state.min_size)
 
 
 def round_to_tick(price: float, tick: float, side: str) -> float:

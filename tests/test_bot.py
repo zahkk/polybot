@@ -1,12 +1,12 @@
 import pytest
-from fakes import FakePublic, make_market, make_reward
+from fakes import FakePublic, book_event, change_event, make_market, make_reward, tick_event
 from fastapi.testclient import TestClient
 
 from polybot.analyst import Forecast
 from polybot.config import Settings
 from polybot.dashboard import build_app
 from polybot.db import DB
-from polybot.exchange import PaperExchange, round_to_tick
+from polybot.exchange import BookCache, PaperExchange, round_to_tick
 from polybot.forecaster import Forecaster
 from polybot.market_maker import MarketMaker
 from polybot.risk import Risk
@@ -402,3 +402,71 @@ def test_take_fills_available_and_leaves_nothing_resting(env):
     # Selling more than we hold only sells what we have.
     ex.take(token_id="Y1", side="SELL", size=50, limit_price=0.40, strategy="fc", market="m1", outcome="Yes")
     assert db.position("Y1") is None and ex.open_orders() == []
+
+
+def test_book_cache_snapshot_gives_best_first_book():
+    cache = BookCache()
+    cache.apply(book_event("Y1", bids=[(0.44, 20), (0.46, 100), (0.45, 50)], asks=[(0.49, 10), (0.47, 30)],
+                           tick=0.001, min_size=5))
+    b = cache.get("Y1")
+    assert b.bids == [(0.46, 100), (0.45, 50), (0.44, 20)] and b.asks == [(0.47, 30), (0.49, 10)]
+    assert (b.best_bid, b.bid_depth, b.best_ask, b.ask_depth) == (0.46, 100, 0.47, 30)
+    assert (b.tick, b.min_size) == (0.001, 5)
+    assert cache.get("N1") is None  # never had a snapshot
+
+
+def test_book_cache_price_changes_set_totals_and_remove_empty_levels():
+    cache = BookCache()
+    cache.apply(book_event("Y1", bids=[(0.46, 100), (0.45, 50)], asks=[(0.47, 30)]))
+    cache.apply(change_event(
+        ("Y1", "BUY", 0.46, 80),   # new total at 0.46, not +80
+        ("Y1", "BUY", 0.45, 0),    # nobody left at 0.45
+        ("Y1", "BUY", 0.44, 10),   # new level
+        ("Y1", "SELL", 0.48, 25),  # SELL side updates the asks
+    ))
+    b = cache.get("Y1")
+    assert b.bids == [(0.46, 80), (0.44, 10)]
+    assert b.asks == [(0.47, 30), (0.48, 25)]
+
+
+def test_book_cache_routes_changes_by_token_and_skips_tokens_without_snapshot():
+    cache = BookCache()
+    cache.apply(book_event("Y1", bids=[(0.46, 100)], asks=[(0.47, 30)]))
+    cache.apply(book_event("N1", bids=[(0.53, 30)], asks=[(0.54, 100)]))
+    # One event carries both sides of the market (YES bid mirrors NO ask), plus a token we never saw.
+    cache.apply(change_event(("Y1", "BUY", 0.46, 90), ("N1", "SELL", 0.54, 90), ("X9", "BUY", 0.10, 5)))
+    assert cache.get("Y1").bids == [(0.46, 90)]
+    assert cache.get("N1").asks == [(0.54, 90)]
+    assert cache.get("X9") is None  # a book built from changes alone would be incomplete
+
+
+def test_book_cache_snapshot_replaces_book_and_keeps_known_tick():
+    cache = BookCache()
+    cache.apply(book_event("Y1", bids=[(0.46, 100), (0.45, 50)], asks=[(0.47, 30)], tick=0.001, min_size=5))
+    # The 0.45 bid was cancelled while we missed its change; the next snapshot must drop it.
+    cache.apply(book_event("Y1", bids=[(0.46, 100)], asks=[(0.47, 30)], tick=None, min_size=None))
+    b = cache.get("Y1")
+    assert b.bids == [(0.46, 100)]
+    assert (b.tick, b.min_size) == (0.001, 5)  # snapshot left them out: keep what we knew
+    cache.apply(tick_event("Y1", 0.01))
+    assert cache.get("Y1").tick == 0.01
+
+
+def test_book_cache_get_returns_a_copy():
+    cache = BookCache()
+    cache.apply(book_event("Y1", bids=[(0.46, 100)], asks=[(0.47, 30)]))
+    b = cache.get("Y1")
+    cache.apply(change_event(("Y1", "BUY", 0.46, 0)))
+    assert b.bids == [(0.46, 100)]  # the market maker's Book doesn't change under it
+    assert cache.get("Y1").bids == []
+
+
+def test_book_cache_is_unusable_when_stream_is_silent_or_cleared():
+    cache = BookCache()
+    cache.apply(book_event("Y1", bids=[(0.46, 100)], asks=[(0.47, 30)]))
+    cache.last_message -= 120  # nothing heard from the stream for 2 minutes
+    assert cache.get("Y1") is None
+    cache.apply(change_event(("Y1", "BUY", 0.46, 90)))  # stream is back
+    assert cache.get("Y1").bids == [(0.46, 90)]
+    cache.clear()  # e.g. after a disconnect
+    assert cache.get("Y1") is None
