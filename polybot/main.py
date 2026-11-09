@@ -9,12 +9,13 @@ from pathlib import Path
 
 import httpx
 import uvicorn
+from polymarket import AsyncPublicClient
 
 from .analyst import Analyst
 from .config import Settings
 from .dashboard import build_app
 from .db import DB, utc_day
-from .exchange import make_exchange
+from .exchange import BookCache, make_exchange, run_market_stream
 from .forecaster import Forecaster
 from .market_maker import MarketMaker
 from .news import RSSSource, XSource, load_feeds
@@ -63,6 +64,8 @@ class Bot:
                 self.fc = Forecaster(s, self.db, self.ex, self.risk, Analyst(s, self.db),
                                      RSSSource(load_feeds(s.feeds_file)), x, self.notify)
         self._last_error_alert = 0.0
+        self.cache = BookCache()
+        self.ex.cache = self.cache
 
     # --- notifications (callable from worker threads) --------------------------------------
     def notify(self, text: str) -> None:
@@ -116,6 +119,10 @@ class Bot:
         if hasattr(self.ex, "rewards_paid"):
             for day in (utc_day(time.time() - 86400), utc_day()):
                 self.db.set_reward("real", self.ex.rewards_paid(day), day)
+
+    def stream_tokens(self) -> set[str]:
+        markets = list(self.mm.markets.values()) if self.mm else []
+        return {t for m in markets for t in (m.yes_token, m.no_token)}
 
     # --- state for dashboard / telegram ----------------------------------------------
     def question(self, market: str) -> str:
@@ -268,6 +275,8 @@ class Bot:
             self.daily_summary(),
             self.run_every("core", self.s.mm_refresh_seconds, self.core_tick),
         ]
+        if self.mm and self.s.mm_use_stream:
+            tasks.append(run_market_stream(self.cache, self.stream_tokens, AsyncPublicClient()))
         if self.fc:
             tasks.append(self.run_every("forecaster", self.s.fc_poll_seconds, self.fc.step))
         if self.s.live:
