@@ -191,22 +191,32 @@ def round_to_tick(price: float, tick: float, side: str) -> float:
 
 
 class BaseExchange:
-    def __init__(self, settings: Settings, db: DB, public: PublicClient):
+    def __init__(self, settings: Settings, db: DB, public: PublicClient, cache: BookCache | None = None):
         self.s = settings
         self.db = db
         self.public = public
+        self.cache = cache  # live books from the market WebSocket; None = always ask the REST API
 
     # --- market data (shared) --------------------------------------------------------
     def book(self, token_id: str) -> Book:
-        return _to_book(self.public.get_order_book(token_id=token_id))
+        cached = self.cache.get(token_id) if self.cache else None
+        return cached or _to_book(self.public.get_order_book(token_id=token_id))
 
     def books(self, token_ids: list[str]) -> dict[str, Book]:
         out: dict[str, Book] = {}
-        for i in range(0, len(token_ids), 50):
-            for ob in self.public.get_order_books(token_ids=token_ids[i : i + 50]):
+        if self.cache:
+            for t in token_ids:
+                b = self.cache.get(t)
+                if b is not None:
+                    out[t] = b
+        # Whatever the stream can't vouch for (no snapshot yet, stream quiet) comes from REST.
+        missing = [t for t in token_ids if t not in out]
+        for i in range(0, len(missing), 50):
+            for ob in self.public.get_order_books(token_ids=missing[i : i + 50]):
                 b = _to_book(ob)
                 out[b.token_id] = b
         return out
+
 
     def midpoints(self, token_ids: list[str]) -> dict[str, float]:
         out: dict[str, float] = {}

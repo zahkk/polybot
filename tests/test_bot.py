@@ -470,3 +470,28 @@ def test_book_cache_is_unusable_when_stream_is_silent_or_cleared():
     assert cache.get("Y1").bids == [(0.46, 90)]
     cache.clear()  # e.g. after a disconnect
     assert cache.get("Y1") is None
+
+
+def test_books_prefer_the_stream_cache(env):
+    s, db, pub, ex, risk, notes = env
+    pub.set_book("Y1", 0.40, 0.42)  # what the REST API would say
+    cache = BookCache()
+    cache.apply(book_event("Y1", bids=[(0.46, 100)], asks=[(0.47, 30)]))
+    ex.cache = cache
+    assert ex.books(["Y1"])["Y1"].best_bid == 0.46
+    assert ex.book("Y1").best_bid == 0.46
+
+
+def test_books_fall_back_to_rest_for_tokens_the_cache_lacks(env):
+    s, db, pub, ex, risk, notes = env
+    pub.set_book("Y1", 0.40, 0.42)
+    pub.set_book("N1", 0.57, 0.59)
+    cache = BookCache()
+    cache.apply(book_event("Y1", bids=[(0.46, 100)], asks=[(0.47, 30)]))
+    ex.cache = cache
+    books = ex.books(["Y1", "N1"])
+    assert books["Y1"].best_bid == 0.46  # from the stream
+    assert books["N1"].best_bid == 0.57  # from REST
+    cache.last_message -= 120  # stream went quiet: everything comes from REST again
+    assert ex.books(["Y1"])["Y1"].best_bid == 0.40
+    assert ex.book("Y1").best_bid == 0.40
